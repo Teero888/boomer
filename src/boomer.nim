@@ -8,8 +8,9 @@ import x11/xlib,
        x11/x,
        x11/xutil,
        x11/keysym,
-       x11/xrandr,
-       x11/cursorfont
+       x11/xrandr
+when defined(select):
+  import x11/cursorfont
 import opengl, opengl/glx
 import la
 import strutils
@@ -84,14 +85,16 @@ type Flashlight = object
   shadow: float32
   radius: float32
   deltaRadius: float32
+  kbDeltaRadius: float32
 
 const
   INITIAL_FL_DELTA_RADIUS = 250.0
   FL_DELTA_RADIUS_DECELERATION = 10.0
 
 proc update(flashlight: var Flashlight, dt: float32) =
-  if abs(flashlight.deltaRadius) > 1.0:
-    flashlight.radius = max(0.0, flashlight.radius + flashlight.deltaRadius * dt)
+  if abs(flashlight.deltaRadius) > 1.0 or abs(flashlight.kbDeltaRadius) > 0.1:
+    let delta = flashlight.deltaRadius + flashlight.kbDeltaRadius * flashlight.radius
+    flashlight.radius = max(0.0, flashlight.radius + delta * dt)
     flashlight.deltaRadius -= flashlight.deltaRadius * FL_DELTA_RADIUS_DECELERATION * dt
 
   if flashlight.isEnabled:
@@ -136,37 +139,36 @@ proc getCursorPosition(display: PDisplay): Vec2f =
   result.x = root_x.float32
   result.y = root_y.float32
 
-proc selectWindow(display: PDisplay): Window =
-  var cursor = XCreateFontCursor(display, XC_crosshair)
-  defer: discard XFreeCursor(display, cursor)
+when defined(select):
+  proc selectWindow(display: PDisplay): Window =
+    var cursor = XCreateFontCursor(display, XC_crosshair)
+    defer: discard XFreeCursor(display, cursor)
 
-  var root = DefaultRootWindow(display)
-  discard XGrabPointer(display, root, 0,
-                       ButtonMotionMask or
-                       ButtonPressMask or
-                       ButtonReleaseMask,
-                       GrabModeAsync, GrabModeAsync,
-                       root, cursor,
-                       CurrentTime)
-  defer: discard XUngrabPointer(display, CurrentTime)
+    var root = DefaultRootWindow(display)
+    discard XGrabPointer(display, root, 0,
+                         ButtonMotionMask or
+                         ButtonPressMask or
+                         ButtonReleaseMask,
+                         GrabModeAsync, GrabModeAsync,
+                         root, cursor,
+                         CurrentTime)
+    defer: discard XUngrabPointer(display, CurrentTime)
 
-  discard XGrabKeyboard(display, root, 0,
-                        GrabModeAsync, GrabModeAsync,
-                        CurrentTime)
-  defer: discard XUngrabKeyboard(display, CurrentTime)
+    discard XGrabKeyboard(display, root, 0,
+                          GrabModeAsync, GrabModeAsync,
+                          CurrentTime)
+    defer: discard XUngrabKeyboard(display, CurrentTime)
 
-  var event: XEvent
-  while true:
-    discard XNextEvent(display, addr event)
-    case event.theType
-    of ButtonPress:
-      return event.xbutton.subwindow
-    of KeyPress:
-      return root
-    else:
-      discard
-
-  return root
+    var event: XEvent
+    while true:
+      discard XNextEvent(display, addr event)
+      case event.theType
+      of ButtonPress:
+        return event.xbutton.subwindow
+      of KeyPress:
+        return root
+      else:
+        discard
 
 proc xElevenErrorHandler(display: PDisplay, errorEvent: PXErrorEvent): cint{.cdecl.} =
   const CAPACITY = 256
@@ -209,20 +211,6 @@ proc main() =
         body
         i += 1
 
-      template asOptionalParam(paramVar: untyped, body: untyped) =
-        let paramVar = block:
-          var resultVal = none(string)
-          if i + 1 <= paramCount():
-            let param = paramStr(i + 1)
-            if len(param) > 0 and param[0] != '-':
-              resultVal = some(param)
-          resultVal
-        body
-        if paramVar.isNone:
-          i += 1
-        else:
-          i += 2
-
       case arg
       of "-d", "--delay":
         asParam(delayParam):
@@ -237,17 +225,24 @@ proc main() =
         asFlag():
           versionQuit()
       of "--new-config":
-        asOptionalParam(configName):
-          let newConfigPath = configName.get(configFile)
+        let configName = block:
+          var resultVal = none(string)
+          if i + 1 <= paramCount():
+            let param = paramStr(i + 1)
+            if len(param) > 0 and param[0] != '-':
+              resultVal = some(param)
+          resultVal
+        
+        let newConfigPath = configName.get(configFile)
 
-          createDir(newConfigPath.splitFile.dir)
-          if newConfigPath.fileExists:
-            stdout.write("File ", newConfigPath, " already exists. Replace it? [yn] ")
-            if stdin.readChar != 'y':
-              quit "Disaster prevented"
+        createDir(newConfigPath.splitFile.dir)
+        if newConfigPath.fileExists:
+          stdout.write("File ", newConfigPath, " already exists. Replace it? [yn] ")
+          if stdin.readChar != 'y':
+            quit "Disaster prevented"
 
-          generateDefaultConfig(newConfigPath)
-          quit "Generated config at $#" % [newConfigPath]
+        generateDefaultConfig(newConfigPath)
+        quit "Generated config at $#" % [newConfigPath]
       of "-c", "--config":
         asParam(configParam):
           configFile = configParam
@@ -331,9 +326,9 @@ proc main() =
 
   var wmName = "boomer"
   var wmClass = "Boomer"
-  var hints = XClassHint(res_name: wmName, res_class: wmClass)
+  var hints = XClassHint(res_name: wmName.cstring, res_class: wmClass.cstring)
 
-  discard XStoreName(display, win, wmName)
+  discard XStoreName(display, win, wmName.cstring)
   discard XSetClassHint(display, win, addr(hints))
 
   var wmDeleteMessage = XInternAtom(
@@ -492,13 +487,21 @@ proc main() =
         of XK_0:
           camera.scale = 1.0
           camera.deltaScale = 0.0
+          camera.kbZoom = 0.0
           camera.position = vec2(0.0'f32, 0.0)
           camera.velocity = vec2(0.0'f32, 0.0)
         of XK_q, XK_Escape:
           quitting = true
         of XK_r:
-          if configFile.len > 0 and fileExists(configFile):
-            config = loadConfig(configFile)
+          if (xev.xkey.state and ShiftMask) > 0.uint32:
+            if configFile.len > 0 and fileExists(configFile):
+              config = loadConfig(configFile)
+          else:
+            camera.scale = 1.0
+            camera.deltaScale = 0.0
+            camera.kbZoom = 0.0
+            camera.position = vec2(0.0'f32, 0.0)
+            camera.velocity = vec2(0.0'f32, 0.0)
 
           when defined(developer):
             if (xev.xkey.state and ControlMask) > 0.uint32:
@@ -517,6 +520,50 @@ proc main() =
 
         of XK_f:
           flashlight.isEnabled = not flashlight.isEnabled
+        of XK_h: camera.kbMovement.x = -1.0
+        of XK_l: camera.kbMovement.x = 1.0
+        of XK_k: camera.kbMovement.y = -1.0
+        of XK_j: camera.kbMovement.y = 1.0
+        of XK_w:
+          if (xev.xkey.state and ControlMask) > 0.uint32:
+            flashlight.kbDeltaRadius = config.scrollSpeed
+          else:
+            camera.kbZoom = config.scrollSpeed
+            camera.scalePivot = mouse.curr
+        of XK_s:
+          if (xev.xkey.state and ControlMask) > 0.uint32:
+            flashlight.kbDeltaRadius = -config.scrollSpeed
+          else:
+            camera.kbZoom = -config.scrollSpeed
+            camera.scalePivot = mouse.curr
+        else:
+          discard
+
+      of KeyRelease:
+        var key = XLookupKeysym(cast[PXKeyEvent](xev.addr), 0)
+        case key
+        of XK_h:
+          if camera.kbMovement.x == -1.0:
+            camera.kbMovement.x = 0
+        of XK_l:
+          if camera.kbMovement.x == 1.0:
+            camera.kbMovement.x = 0
+        of XK_k:
+          if camera.kbMovement.y == -1.0:
+            camera.kbMovement.y = 0
+        of XK_j:
+          if camera.kbMovement.y == 1.0:
+            camera.kbMovement.y = 0
+        of XK_w:
+          if camera.kbZoom > 0:
+            camera.kbZoom = 0
+          if flashlight.kbDeltaRadius > 0:
+            flashlight.kbDeltaRadius = 0
+        of XK_s:
+          if camera.kbZoom < 0:
+            camera.kbZoom = 0
+          if flashlight.kbDeltaRadius < 0:
+            flashlight.kbDeltaRadius = 0
         else:
           discard
 
